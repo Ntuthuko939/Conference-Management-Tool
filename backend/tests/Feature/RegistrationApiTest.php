@@ -1,0 +1,437 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\User;
+use App\Modules\Conferences\Models\Conference;
+use App\Modules\Registrations\Actions\SendConferenceRemindersAction;
+use App\Modules\Registrations\Models\Registration;
+use App\Modules\Registrations\Notifications\RegistrationCancelledNotification;
+use App\Notifications\CmtNotification;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Notification;
+use Tests\TestCase;
+
+class RegistrationApiTest extends TestCase
+{
+    use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        Notification::fake();
+    }
+
+    public function test_registration_endpoints_require_authentication(): void
+    {
+        $this->getJson('/api/v1/registrations')
+            ->assertUnauthorized();
+
+        $this->postJson('/api/v1/registrations', [])
+            ->assertUnauthorized();
+
+        $this->getJson('/api/v1/registrations/1')
+            ->assertUnauthorized();
+
+        $this->putJson('/api/v1/registrations/1', [])
+            ->assertUnauthorized();
+
+        $this->deleteJson('/api/v1/registrations/1')
+            ->assertUnauthorized();
+    }
+
+    public function test_authenticated_user_can_register_for_conference(): void
+    {
+        $user = User::factory()->create();
+        $conference = Conference::factory()->create();
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [
+                'conference_id' => $conference->id,
+            ])
+            ->assertCreated()
+            ->assertJsonPath('data.user_id', $user->id)
+            ->assertJsonPath('data.conference_id', $conference->id)
+            ->assertJsonPath('data.status', 'registered');
+
+        $this->assertDatabaseHas('conference_registrations', [
+            'conference_id' => $conference->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+        ]);
+    }
+
+    public function test_cancelled_registration_can_be_reactivated_without_creating_duplicate_row(): void
+    {
+        $user = User::factory()->create();
+        $conference = Conference::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => $user->id,
+            'status' => 'cancelled',
+            'registered_at' => now()->subDays(2),
+            'cancelled_at' => now()->subDay(),
+            'reminder_sent_at' => now()->subDay(),
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [
+                'conference_id' => $conference->id,
+            ])
+            ->assertCreated()
+            ->assertJsonPath('data.id', $registration->id)
+            ->assertJsonPath('data.status', 'registered')
+            ->assertJsonPath('data.cancelled_at', null)
+            ->assertJsonPath('data.reminder_sent_at', null);
+
+        $this->assertDatabaseCount(
+            'conference_registrations',
+            1
+        );
+
+        $this->assertDatabaseHas('conference_registrations', [
+            'id' => $registration->id,
+            'conference_id' => $conference->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+            'cancelled_at' => null,
+            'reminder_sent_at' => null,
+        ]);
+    }
+
+    public function test_sends_one_reminder_for_each_active_registration_starting_tomorrow(): void
+    {
+        $attendee = User::factory()->create(['role' => 'attendee']);
+        $conference = Conference::factory()->create([
+            'start_date' => now()->addDay()->toDateString(),
+            'end_date' => now()->addDays(2)->toDateString(),
+        ]);
+        $registration = Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => $attendee->id,
+            'status' => 'registered',
+        ]);
+
+        $action = app(SendConferenceRemindersAction::class);
+
+        $this->assertSame(1, $action->execute());
+        $this->assertSame(0, $action->execute());
+
+        Notification::assertSentTo(
+            $attendee,
+            CmtNotification::class,
+            fn (CmtNotification $notification) => $notification->kind === 'conference_reminder'
+                && $notification->metadata['registration_id'] === $registration->id
+        );
+
+        $this->assertCount(
+            1,
+            Notification::sent($attendee, CmtNotification::class)
+        );
+    }
+
+    public function test_client_cannot_register_another_user_or_set_status(): void
+    {
+        $user = User::factory()->create();
+        $otherUser = User::factory()->create();
+        $conference = Conference::factory()->create();
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [
+                'conference_id' => $conference->id,
+                'user_id' => $otherUser->id,
+                'status' => 'cancelled',
+            ])
+            ->assertCreated()
+            ->assertJsonPath('data.user_id', $user->id)
+            ->assertJsonPath('data.status', 'registered');
+    }
+
+    public function test_registration_requires_existing_conference(): void
+    {
+        $user = User::factory()->create();
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['conference_id']);
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [
+                'conference_id' => 999999,
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['conference_id']);
+    }
+
+    public function test_duplicate_registration_is_rejected(): void
+    {
+        $user = User::factory()->create();
+        $conference = Conference::factory()->create();
+
+        Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->postJson('/api/v1/registrations', [
+                'conference_id' => $conference->id,
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['conference_id']);
+    }
+
+    public function test_regular_user_only_lists_own_registrations(): void
+    {
+        $user = User::factory()->create();
+        $otherUser = User::factory()->create();
+        $conference = Conference::factory()->create();
+
+        Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => $user->id,
+        ]);
+
+        Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => $otherUser->id,
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->getJson('/api/v1/registrations')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.user_id', $user->id);
+    }
+
+    public function test_organiser_only_lists_registrations_for_owned_conferences(): void
+    {
+        $organiser = User::factory()->create(['role' => 'organiser']);
+        $otherOrganiser = User::factory()->create(['role' => 'organiser']);
+
+        $ownedConference = Conference::factory()
+            ->for($organiser, 'organiser')
+            ->create();
+
+        $otherConference = Conference::factory()
+            ->for($otherOrganiser, 'organiser')
+            ->create();
+
+        Registration::create([
+            'conference_id' => $ownedConference->id,
+            'user_id' => User::factory()->create()->id,
+        ]);
+
+        Registration::create([
+            'conference_id' => $otherConference->id,
+            'user_id' => User::factory()->create()->id,
+        ]);
+
+        $this->actingAs($organiser, 'sanctum')
+            ->getJson('/api/v1/registrations')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath(
+                'data.0.conference_id',
+                $ownedConference->id
+            );
+    }
+
+    public function test_registration_list_supports_filters_and_pagination(): void
+    {
+        $admin = User::factory()->create(['role' => 'admin']);
+        $conference = Conference::factory()->create();
+
+        Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => User::factory()->create()->id,
+            'status' => 'registered',
+        ]);
+
+        Registration::create([
+            'conference_id' => $conference->id,
+            'user_id' => User::factory()->create()->id,
+            'status' => 'cancelled',
+            'cancelled_at' => now(),
+        ]);
+
+        $this->actingAs($admin, 'sanctum')
+            ->getJson(
+                "/api/v1/registrations?conference_id={$conference->id}&status=cancelled&per_page=1"
+            )
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.status', 'cancelled')
+            ->assertJsonPath('meta.per_page', 1);
+    }
+
+    public function test_owner_can_view_registration(): void
+    {
+        $user = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $user->id,
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->getJson("/api/v1/registrations/{$registration->id}")
+            ->assertOk()
+            ->assertJsonPath('data.id', $registration->id);
+    }
+
+    public function test_user_cannot_view_another_users_registration(): void
+    {
+        $owner = User::factory()->create();
+        $otherUser = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $owner->id,
+        ]);
+
+        $this->actingAs($otherUser, 'sanctum')
+            ->getJson("/api/v1/registrations/{$registration->id}")
+            ->assertForbidden();
+    }
+
+    public function test_owner_can_update_registration_status(): void
+    {
+        $user = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->putJson("/api/v1/registrations/{$registration->id}", [
+                'status' => 'cancelled',
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.status', 'cancelled');
+
+        $this->assertDatabaseHas('conference_registrations', [
+            'id' => $registration->id,
+            'status' => 'cancelled',
+        ]);
+    }
+
+    public function test_registration_update_rejects_invalid_status(): void
+    {
+        $user = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $user->id,
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->putJson("/api/v1/registrations/{$registration->id}", [
+                'status' => 'invalid-status',
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['status']);
+    }
+
+    public function test_owner_can_cancel_registration(): void
+    {
+        $user = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->deleteJson("/api/v1/registrations/{$registration->id}")
+            ->assertOk();
+
+        $this->assertDatabaseHas('conference_registrations', [
+            'id' => $registration->id,
+            'status' => 'cancelled',
+        ]);
+    }
+
+    public function test_cancelling_an_already_cancelled_registration_is_idempotent(): void
+    {
+        $user = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $user->id,
+            'status' => 'registered',
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->deleteJson("/api/v1/registrations/{$registration->id}")
+            ->assertOk();
+
+        $firstCancelledAt = Registration::findOrFail(
+            $registration->id
+        )->cancelled_at;
+
+        $this->actingAs($user, 'sanctum')
+            ->deleteJson("/api/v1/registrations/{$registration->id}")
+            ->assertOk();
+
+        $this->assertDatabaseHas('conference_registrations', [
+            'id' => $registration->id,
+            'status' => 'cancelled',
+        ]);
+
+        $this->assertDatabaseCount(
+            'conference_registrations',
+            1
+        );
+
+        $this->assertEquals(
+            $firstCancelledAt,
+            Registration::findOrFail($registration->id)->cancelled_at
+        );
+
+        $this->assertCount(
+            1,
+            Notification::sent(
+                $user,
+                RegistrationCancelledNotification::class
+            )
+        );
+    }
+
+    public function test_non_owner_cannot_update_or_cancel_registration(): void
+    {
+        $owner = User::factory()->create();
+        $otherUser = User::factory()->create();
+
+        $registration = Registration::create([
+            'conference_id' => Conference::factory()->create()->id,
+            'user_id' => $owner->id,
+        ]);
+
+        $this->actingAs($otherUser, 'sanctum')
+            ->putJson("/api/v1/registrations/{$registration->id}", [
+                'status' => 'cancelled',
+            ])
+            ->assertForbidden();
+
+        $this->actingAs($otherUser, 'sanctum')
+            ->deleteJson("/api/v1/registrations/{$registration->id}")
+            ->assertForbidden();
+    }
+
+    public function test_nonexistent_registration_returns_404(): void
+    {
+        $user = User::factory()->create();
+
+        $this->actingAs($user, 'sanctum')
+            ->getJson('/api/v1/registrations/999999')
+            ->assertNotFound();
+    }
+}
